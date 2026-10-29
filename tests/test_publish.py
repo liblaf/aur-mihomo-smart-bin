@@ -49,11 +49,11 @@ class PublicationTests(unittest.TestCase):
         self.base = self.run_git(self.root, "rev-parse", "HEAD")
         self.addCleanup(patch.stopall)
         patch.object(publish, "ROOT", self.root).start()
-        patch.dict(os.environ, GITHUB_REPOSITORY=publish.REPOSITORY, GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="2", GITHUB_GIT_SSH_COMMAND="ssh -i /github-key -oBatchMode=yes", GIT_SSH_COMMAND="ssh -oBatchMode=yes").start()
+        patch.dict(os.environ, GITHUB_REPOSITORY=publish.REPOSITORY, GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="2", GIT_SSH_COMMAND="ssh -oBatchMode=yes").start()
         self.api_calls = []
         self.github_git_calls = []
         self.aur_push_env = None
-        self.github_git_error = None
+        self.aur_push_error = None
         self.real_git = publish.git
         patch.object(publish, "git", side_effect=self.routed_git).start()
         self.make_candidate()
@@ -61,10 +61,10 @@ class PublicationTests(unittest.TestCase):
     def routed_git(self, directory, *args, env=None):
         if directory == self.aur and "push" in args:
             self.aur_push_env = env
+            if self.aur_push_error:
+                raise publish.PublishError(self.aur_push_error)
         if f"git@github.com:{publish.REPOSITORY}.git" in args:
             self.github_git_calls.append((args, env))
-            if self.github_git_error and "push" in args:
-                raise publish.PublishError(self.github_git_error)
             return ""
         return self.real_git(directory, *args, env=env)
 
@@ -101,83 +101,121 @@ class PublicationTests(unittest.TestCase):
 
     def api(self, args, payload=None):
         self.api_calls.append((args, payload))
-        if "/git/commits/" in args[0]:
-            return {"verification": {"verified": True}}
-        if args[0] == "graphql":
-            self.payload = payload
-            return {"data": {"createCommitOnBranch": {"commit": {"oid": "f" * 40}}}}
+        self.assertEqual(args, (f"repos/{publish.REPOSITORY}/git/ref/heads/main",))
+        self.assertIsNone(payload)
         return {"object": {"sha": self.base}}
 
-    def test_publishes_and_pins_github_expected_head(self):
-        with patch.object(publish, "gh_api", side_effect=self.api):
-            publish.publish(self.candidate, self.aur)
-        self.assertEqual(self.run_git(self.remote, "rev-parse", "HEAD"), self.run_git(self.aur, "rev-parse", "HEAD"))
-        self.assertEqual(publish.tree_hashes(self.aur, "HEAD"), json.loads((self.candidate / "manifest.json").read_text())["sha256"])
-        inputs = self.payload["variables"]["input"]
-        self.assertEqual(inputs["expectedHeadOid"], self.base)
-        self.assertEqual(inputs["branch"], {"repositoryNameWithOwner": publish.REPOSITORY, "branchName": "aur-automation/123-2"})
-        self.assertIn("aur-state.json", {f["path"] for f in inputs["fileChanges"]["additions"]})
+    def root_files(self):
+        return {p.name: p.read_bytes() for p in self.root.iterdir() if p.is_file()}
 
-    def test_signed_commit_uses_scoped_key_and_cleans_temporary_branch(self):
-        with patch.object(publish, "gh_api", side_effect=self.api):
-            publish.publish(self.candidate, self.aur)
-        creation = next(payload for args, payload in self.api_calls if args[:2] == ("--method", "POST"))
-        self.assertEqual(creation, {"ref": "refs/heads/aur-automation/123-2", "sha": self.base})
-        self.assertEqual(self.api_calls[-1][0], ("--method", "DELETE", f"repos/{publish.REPOSITORY}/git/refs/heads/aur-automation/123-2"))
-        self.assertEqual(len(self.github_git_calls), 2)
-        for args, env in self.github_git_calls:
-            self.assertEqual(env["GIT_SSH_COMMAND"], os.environ["GITHUB_GIT_SSH_COMMAND"])
-            self.assertEqual(env["GIT_LFS_SKIP_PUSH"], "1")
-        self.assertEqual(self.aur_push_env["GIT_SSH_COMMAND"], "ssh -oBatchMode=yes")
-        self.assertEqual(self.github_git_calls[-1][0][-1], "f" * 40 + ":refs/heads/main")
+    def assert_prepared(self):
+        manifest = json.loads((self.candidate / "manifest.json").read_text())
+        aur_head = self.run_git(self.aur, "rev-parse", "HEAD")
+        self.assertEqual(self.run_git(self.remote, "rev-parse", "HEAD"), aur_head)
+        self.assertEqual(publish.tree_hashes(self.aur, "HEAD"), manifest["sha256"])
+        for name in publish.FILES:
+            self.assertEqual((self.root / name).read_bytes(), (self.candidate / name).read_bytes())
+        self.assertEqual(json.loads((self.root / "aur-state.json").read_text()),
+                         {"commit": aur_head, "sha256": manifest["sha256"]})
+        report = json.loads((self.root / "automation-validation.json").read_text())
+        self.assertEqual(report["base_commit"], self.base)
+        self.assertEqual(report["version"], manifest["version"])
+        self.assertEqual(report["pkgrel"], manifest["pkgrel"])
+        self.assertEqual(report["run_url"], f"https://github.com/{publish.REPOSITORY}/actions/runs/123")
+        self.assertTrue(report["validated_at"])
         self.assertEqual(self.run_git(self.root, "rev-parse", "HEAD"), self.base)
-        self.assertEqual(self.run_git(self.root, "status", "--porcelain"), "")
-
-    def test_unverified_commit_cannot_reach_main_and_branch_is_cleaned(self):
-        def unsigned(args, payload=None):
-            response = self.api(args, payload)
-            if "/git/commits/" in args[0]:
-                return {"verification": {"verified": False}}
-            return response
-        with patch.object(publish, "gh_api", side_effect=unsigned):
-            with self.assertRaisesRegex(publish.PublishError, "not verified"):
-                publish.publish(self.candidate, self.aur)
+        changed = self.run_git(self.root, "diff", "--name-only").splitlines()
+        untracked = self.run_git(self.root, "ls-files", "--others", "--exclude-standard").splitlines()
+        self.assertEqual(set(changed + untracked), {"PKGBUILD", ".SRCINFO", "aur-state.json", "automation-validation.json"})
         self.assertEqual(self.github_git_calls, [])
-        self.assertEqual(self.api_calls[-1][0][:2], ("--method", "DELETE"))
+        self.assertEqual(self.api_calls, [((f"repos/{publish.REPOSITORY}/git/ref/heads/main",), None)])
 
-    def test_github_push_failure_still_cleans_temporary_branch(self):
-        self.github_git_error = "GitHub fast-forward rejected"
-        with patch.object(publish, "gh_api", side_effect=self.api):
-            with self.assertRaisesRegex(publish.PublishError, "fast-forward rejected"):
-                publish.publish(self.candidate, self.aur)
-        self.assertEqual(len(self.github_git_calls), 2)
-        self.assertEqual(self.api_calls[-1][0][:2], ("--method", "DELETE"))
+    def test_prepares_publication_files_after_aur_push(self):
+        with patch.object(publish, "gh_api", side_effect=self.api), patch.dict(os.environ, GITHUB_GIT_SSH_COMMAND=""):
+            publish.publish(self.candidate, self.aur)
+        self.assert_prepared()
+        self.assertEqual(self.aur_push_env["GIT_SSH_COMMAND"], "ssh -oBatchMode=yes")
+        self.assertEqual(self.aur_push_env["GIT_LFS_SKIP_PUSH"], "1")
 
-    def test_missing_github_credentials_or_attempt_prevents_aur_mutation(self):
+    def test_failed_aur_push_does_not_prepare_github_files(self):
+        before = self.root_files()
+        remote_before = self.run_git(self.remote, "rev-parse", "HEAD")
+        self.aur_push_error = "AUR rejected push"
+        with patch.object(publish, "gh_api", side_effect=self.api), self.assertRaisesRegex(publish.PublishError, "AUR rejected"):
+            publish.publish(self.candidate, self.aur)
+        self.assertEqual(self.root_files(), before)
+        self.assertEqual(self.run_git(self.remote, "rev-parse", "HEAD"), remote_before)
+        self.assertEqual(self.github_git_calls, [])
+
+    def test_missing_run_or_attempt_prevents_aur_mutation(self):
         before = self.run_git(self.aur, "rev-parse", "HEAD")
-        for field in ("GITHUB_RUN_ATTEMPT", "GITHUB_GIT_SSH_COMMAND"):
-            with self.subTest(field=field), patch.dict(os.environ, {field: ""}):
-                with self.assertRaises(publish.PublishError):
-                    publish.publish(self.candidate, self.aur)
+        original = self.root_files()
+        for field in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"):
+            for value in ("", "invalid"):
+                with self.subTest(field=field, value=value), patch.dict(os.environ, {field: value}):
+                    with self.assertRaises(publish.PublishError):
+                        publish.publish(self.candidate, self.aur)
+        self.assertEqual(self.run_git(self.aur, "rev-parse", "HEAD"), before)
+        self.assertEqual(self.root_files(), original)
+
+    def test_rejects_untrusted_repository_before_aur_mutation(self):
+        before = self.run_git(self.aur, "rev-parse", "HEAD")
+        with patch.dict(os.environ, GITHUB_REPOSITORY="other/repository"), self.assertRaisesRegex(publish.PublishError, "trusted GitHub repository"):
+            publish.publish(self.candidate, self.aur)
         self.assertEqual(self.run_git(self.aur, "rev-parse", "HEAD"), before)
 
-    def test_github_delete_accepts_empty_204_response(self):
-        result = subprocess.CompletedProcess([], 0, stdout="", stderr="")
-        with patch.object(publish.subprocess, "run", return_value=result):
-            self.assertEqual(publish.gh_api(("--method", "DELETE", "repos/example/git/refs/heads/temp")), {})
-
-    def test_recovers_after_aur_push_and_github_failure(self):
-        def fail(args, payload=None):
-            if args[0] == "graphql":
-                raise publish.PublishError("temporary API failure")
-            return self.api(args, payload)
-        with patch.object(publish, "gh_api", side_effect=fail), self.assertRaisesRegex(publish.PublishError, "temporary"):
+    def test_retry_after_previous_aur_push_with_original_source_checkout(self):
+        original = self.root_files()
+        with patch.object(publish, "gh_api", side_effect=self.api):
             publish.publish(self.candidate, self.aur)
-        self.assertEqual(self.api_calls[-1][0][:2], ("--method", "DELETE"))
         pushed = self.run_git(self.aur, "rev-parse", "HEAD")
+        # A later workflow run starts from the same GitHub commit after an API failure.
+        for name in self.root_files().keys() - original.keys():
+            (self.root / name).unlink()
+        for name, content in original.items():
+            (self.root / name).write_bytes(content)
+        self.assertEqual(self.run_git(self.root, "status", "--porcelain"), "")
+        self.api_calls.clear()
+        self.aur_push_env = None
         with patch.object(publish, "gh_api", side_effect=self.api):
             publish.publish(self.candidate, self.aur)
         self.assertEqual(self.run_git(self.aur, "rev-parse", "HEAD"), pushed)
+        self.assertIsNone(self.aur_push_env)
+        self.assert_prepared()
+
+    def test_current_package_still_validates_and_prepares_report(self):
+        with patch.object(publish, "gh_api", side_effect=self.api):
+            publish.publish(self.candidate, self.aur)
+        self.commit(self.root)
+        self.base = self.run_git(self.root, "rev-parse", "HEAD")
+        self.rehash()
+        aur_head = self.run_git(self.aur, "rev-parse", "HEAD")
+        self.api_calls.clear()
+        self.aur_push_env = None
+        with patch.object(publish, "gh_api", side_effect=self.api):
+            publish.publish(self.candidate, self.aur)
+        self.assertEqual(self.run_git(self.aur, "rev-parse", "HEAD"), aur_head)
+        self.assertIsNone(self.aur_push_env)
+        self.assertEqual(json.loads((self.root / "automation-validation.json").read_text())["base_commit"], self.base)
+        self.assertEqual(self.run_git(self.root, "diff", "--name-only"), "automation-validation.json")
+        metadata = self.candidate / ".SRCINFO"
+        metadata.write_text(metadata.read_text() + "\tdepends = evil\n")
+        self.rehash()
+        with self.assertRaisesRegex(publish.PublishError, "regenerated metadata"):
+            publish.validate(self.candidate)
+
+    def test_rejects_dirty_source_or_wrong_branch_before_aur_mutation(self):
+        previous = self.run_git(self.aur, "rev-parse", "HEAD")
+        (self.root / "unexpected").touch()
+        with self.assertRaisesRegex(publish.PublishError, "dirty"):
+            publish.publish(self.candidate, self.aur)
+        (self.root / "unexpected").unlink()
+        with self.assertRaisesRegex(publish.PublishError, "requires main"):
+            publish.publish(self.candidate, self.aur, branch="other")
+        self.run_git(self.root, "checkout", "-b", "other")
+        with self.assertRaisesRegex(publish.PublishError, "requires main"):
+            publish.publish(self.candidate, self.aur)
+        self.assertEqual(self.run_git(self.aur, "rev-parse", "HEAD"), previous)
 
     def test_rejects_recipe_execution_even_with_valid_manifest(self):
         recipe = self.candidate / "PKGBUILD"

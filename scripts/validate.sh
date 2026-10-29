@@ -9,10 +9,11 @@ pacman -Syu --needed --noconfirm base-devel git python namcap shellcheck > /tmp/
 }
 useradd --create-home builder
 project=/home/builder/project
-install -d "$project/scripts" "$project/tests"
+install -d "$project/scripts" "$project/tests" "$project/.github/workflows"
 cp /workspace/PKGBUILD /workspace/.SRCINFO /workspace/mihomo-smart-bin.install /workspace/LICENSE /workspace/aur-state.json "$project/"
 cp /workspace/scripts/*.py "$project/scripts/"
 cp /workspace/tests/*.py "$project/tests/"
+cp /workspace/.github/workflows/update.yml "$project/.github/workflows/"
 chown -R builder:builder "$project"
 as_builder() {
   runuser -u builder -- bash -c 'cd /home/builder/project && exec "$@"' bash "$@"

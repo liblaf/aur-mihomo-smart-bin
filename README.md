@@ -57,7 +57,7 @@ For each update, the workflow:
 4. Builds and installs the package in a disposable Arch Linux container, validates
    a Smart configuration, and queries a running Smart group through its controller.
 5. Publishes only validated packaging files to AUR in a separate job, then records
-   the new metadata and AUR commit on GitHub.
+   the new metadata and AUR commit on GitHub with a verified signature.
 
 The rolling release reuses its tag and release ID. Package versions therefore use
 the binary asset's UTC upload timestamp and commit, for example
@@ -104,30 +104,35 @@ gh workflow run update.yml --repo liblaf/aur-mihomo-smart-bin \
   -f validate_current=true
 ```
 
-The private key is never committed. A second `GH_DEPLOY_KEY` environment secret
-holds a write deploy key scoped to this GitHub repository; its public half is
-tracked in
-[config/github-actions-key.pub](https://github.com/liblaf/aur-mihomo-smart-bin/blob/main/config/github-actions-key.pub).
-Validation jobs have no AUR credentials or
-GitHub write token. The publishing job downloads only packaging metadata and
-never executes the downloaded core or a candidate recipe. AUR's server host key
-is pinned in
+The private key is never committed. GitHub publication uses the workflow's
+`GITHUB_TOKEN` with `contents: write` and
+[`suzuki-shunsuke/commit-action` v1.1.0](https://github.com/suzuki-shunsuke/commit-action/releases/tag/v1.1.0),
+pinned to commit `5eaa5ecce3ffe93d09a85b946dc5136e3713b1b7`. The AUR key is the
+only publishing secret needed. Validation jobs have no AUR credentials or GitHub
+write token. The publishing job downloads only packaging metadata and never
+executes the downloaded core or a candidate recipe. AUR's server host key is pinned in
 [config/aur-known-hosts](https://github.com/liblaf/aur-mihomo-smart-bin/blob/main/config/aur-known-hosts).
-The workflow creates GitHub commits on a temporary branch using the workflow
-token, verifies GitHub's signature, then advances `main` with the scoped deploy
-key. The `main-integrity` ruleset still requires verified signatures and forbids
-force pushes, deletion, and branch creation. The `main-review` ruleset preserves
-human review requirements and grants that deploy key a review bypass for
-validated automatic publication.
+
+After AUR accepts the update, the workflow creates a unique temporary branch at
+the validated source commit. The action can commit only `PKGBUILD`, `.SRCINFO`,
+`mihomo-smart-bin.install`, `LICENSE`, `aur-state.json`, and
+`automation-validation.json`. The workflow verifies the resulting signature,
+checks that `main` still matches the validated source commit, and advances `main`
+with a non-forced API update. A concurrent update to `main` stops publication;
+the temporary branch is removed on success or failure. The retained artifact
+supports recovery after AUR has accepted the update.
+
+The `main-integrity` ruleset requires verified signatures and forbids force
+pushes, deletion, and branch creation. Main does not require a pull request for
+publication.
 
 Pushes and pull requests run validation without publication. Scheduled and manual
 runs on this repository's `main` branch can publish. Successful monthly validation
 records keep the repository active; GitHub can disable public-repository schedules
 after 60 days without activity if those checks stop succeeding.
 
-Publishing starts disabled with `AUR_PUBLISH_ENABLED=false` until the dedicated
-public key is registered with AUR. Checks and validation continue while it is
-disabled. Set the variable to `false` again to stop publication.
+Set `AUR_PUBLISH_ENABLED=true` after registering the dedicated public key with
+AUR. Set it to `false` to stop publication while checks and validation continue.
 
 ## Maintain locally
 

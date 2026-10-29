@@ -121,7 +121,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: main
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -131,26 +130,18 @@ jobs:
       - name: Prepare dedicated AUR authentication
         env:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-          GH_DEPLOY_KEY: ${{ secrets.GH_DEPLOY_KEY }}
         run: |
-          if [ -z "$AUR_SSH_PRIVATE_KEY" ] || [ -z "$GH_DEPLOY_KEY" ]; then
-            echo 'Configure AUR_SSH_PRIVATE_KEY and GH_DEPLOY_KEY in the aur-publish environment before publishing.' >&2
+          if [ -z "$AUR_SSH_PRIVATE_KEY" ]; then
+            echo 'Configure AUR_SSH_PRIVATE_KEY in the aur-publish environment before publishing.' >&2
             exit 1
           fi
           umask 077
           printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$RUNNER_TEMP/aur-key"
           ssh-keygen -y -P '' -f "$RUNNER_TEMP/aur-key" > /dev/null
-          printf '%s\n' "$GH_DEPLOY_KEY" > "$RUNNER_TEMP/github-key"
-          ssh-keygen -y -P '' -f "$RUNNER_TEMP/github-key" > /dev/null
-      - name: Publish to AUR and record the validated version on GitHub
+      - name: Publish validated metadata to AUR and prepare GitHub changes
         env:
           GH_TOKEN: ${{ github.token }}
           GIT_LFS_SKIP_PUSH: '1'
-          GITHUB_GIT_SSH_COMMAND: >-
-            ssh -i "${{ runner.temp }}/github-key" -o BatchMode=yes
-            -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes
-            -o UserKnownHostsFile="${{ github.workspace }}/config/github-known-hosts"
-            -o ConnectTimeout=15
           GIT_SSH_COMMAND: >-
             ssh -i "${{ runner.temp }}/aur-key" -o BatchMode=yes
             -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes
@@ -161,4 +152,42 @@ jobs:
           python3 scripts/publish.py --candidate "$RUNNER_TEMP/candidate" --aur-checkout "$RUNNER_TEMP/aur" --branch main
       - name: Remove temporary key
         if: always()
-        run: rm -f "$RUNNER_TEMP/aur-key" "$RUNNER_TEMP/github-key"
+        run: rm -f "$RUNNER_TEMP/aur-key"
+      - name: Prepare GitHub publication branch
+        id: publication-branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f "ref=refs/heads/aur-automation/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            -f "sha=$GITHUB_SHA" > /dev/null
+      - name: Commit validated metadata to GitHub
+        id: commit
+        uses: suzuki-shunsuke/commit-action@5eaa5ecce3ffe93d09a85b946dc5136e3713b1b7 # v1.1.0
+        with:
+          branch: aur-automation/${{ github.run_id }}-${{ github.run_attempt }}
+          commit_message: 'chore: record Mihomo Smart validation [skip ci]'
+          files: |
+            PKGBUILD
+            .SRCINFO
+            mihomo-smart-bin.install
+            LICENSE
+            aur-state.json
+            automation-validation.json
+      - name: Publish the verified commit to main
+        if: steps.commit.outputs.pushed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$COMMIT_SHA" --jq '.verification.verified')" = true
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')" = "$GITHUB_SHA"
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/git/refs/heads/main" \
+            -f "sha=$COMMIT_SHA" -F force=false > /dev/null
+      - name: Remove GitHub publication branch
+        if: always() && steps.publication-branch.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method DELETE \
+            "repos/$GITHUB_REPOSITORY/git/refs/heads/aur-automation/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
