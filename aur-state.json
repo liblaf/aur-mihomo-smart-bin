@@ -1,9 +1,9 @@
 {
-  "commit": "d95ac43f6c93c2fc0a7c0be824e94efefffa22c9",
+  "commit": "96c5ce583ee7b19c15a5d3d08651a8ce1244b634",
   "sha256": {
-    ".SRCINFO": "9937cd16fe80056a7620c15be68e642c0b45433084a9468b68a8f8ee3195fdfa",
+    ".SRCINFO": "0fb7cbccd1491790b7ff256d9d43c18b23378d58842abd4f33238d00fa869044",
     "LICENSE": "2280aa6c971a21b5cc703cd9104b57675dc670056826e8f3aa15bbb0004a6ef2",
-    "PKGBUILD": "0eb0d26bcbc1af2eb97af235203cd8f905aafbbd2887b1a936f00ea78780a986",
+    "PKGBUILD": "2b9f2966ccf277afd4e6c9bd5f602b54c028f3cccb8a18d47251d0c0a1484daa",
     "mihomo-smart-bin.install": "bdc6d608c0e1b5d72af0ec78ed9dbdb089d7aad0b6296529871073354d3a3524"
   }
 }
