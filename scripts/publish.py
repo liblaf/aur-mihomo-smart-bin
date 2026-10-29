@@ -16,7 +16,9 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = "liblaf/aur-mihomo-smart-bin"
 FILES = ("PKGBUILD", ".SRCINFO", "mihomo-smart-bin.install", "LICENSE")
-SCALARS = {"pkgver": r"[0-9]{8}\.[0-9]{6}\.g[0-9a-f]{7,40}",
+VERSION = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+                     r"\.alpha\.smart\.r([1-9][0-9]*)\.g([0-9a-f]{7,40})\Z")
+SCALARS = {"pkgver": VERSION.pattern,
            "pkgrel": r"[1-9][0-9]*", "_commit": r"[0-9a-f]{7,40}",
            "_binary_sha256": r"[0-9a-f]{64}", "_model_sha256": r"[0-9a-f]{64}"}
 COMMIT = re.compile(r"[0-9a-f]{40}\Z")
@@ -77,14 +79,19 @@ def scalars(text: str) -> dict[str, str]:
         if not re.fullmatch(pattern, raw):
             raise PublishError(f"invalid literal {key}")
         values[key] = raw
-    stamp, suffix = values["pkgver"].split(".g")
-    try:
-        datetime.strptime(stamp, "%Y%m%d.%H%M%S")
-    except ValueError as error:
-        raise PublishError("invalid release timestamp") from error
+    _, _, suffix = version_parts(values["pkgver"])
     if suffix != values["_commit"]:
         raise PublishError("version hash disagrees with binary commit")
     return values
+
+
+def version_parts(value: str) -> tuple[tuple[int, int, int], int, str]:
+    """Read canonical upstream version, reachable revision count, and commit."""
+    match = VERSION.fullmatch(value)
+    if match is None:
+        raise PublishError("invalid upstream revision version")
+    major, minor, patch, count, commit = match.groups()
+    return (int(major), int(minor), int(patch)), int(count), commit
 
 
 def recipe_shape(text: str) -> str:
@@ -101,7 +108,7 @@ def srcinfo(before: str, old: dict, new: dict) -> str:
             line = f"\tpkgver = {new['pkgver']}\n"
         elif line.startswith("\tpkgrel = "):
             line = f"\tpkgrel = {new['pkgrel']}\n"
-        elif line.startswith("\tsource = "):
+        elif line.startswith(("\tsource = ", "\tnoextract = ")):
             line = line.replace(old["_commit"], new["_commit"])
         elif line.startswith("\tsha256sums = "):
             for key in ("_binary_sha256", "_model_sha256"):
@@ -148,8 +155,11 @@ def validate(candidate: Path) -> dict:
         expected = int(old["pkgrel"]) + int(changed_model)
         if int(new["pkgrel"]) != expected:
             raise PublishError("model update must increment pkgrel exactly once")
-    elif new["pkgver"][:15] <= old["pkgver"][:15] or new["pkgrel"] != "1":
-        raise PublishError("binary update must advance timestamp and reset pkgrel")
+    else:
+        old_base, old_count, _ = version_parts(old["pkgver"])
+        new_base, new_count, _ = version_parts(new["pkgver"])
+        if new_base < old_base or new_count <= old_count or new["pkgrel"] != "1":
+            raise PublishError("binary update must preserve upstream base, advance revision count, and reset pkgrel")
     return manifest
 
 

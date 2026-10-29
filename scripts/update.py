@@ -3,7 +3,6 @@
 
 import argparse
 import datetime as dt
-import gzip
 import hashlib
 import json
 import os
@@ -12,10 +11,10 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import urllib.error
 import urllib.request
-import zlib
 from dataclasses import dataclass
 
 
@@ -23,9 +22,12 @@ REPOSITORY = "vernesong/mihomo"
 BINARY_TAG = "Prerelease-Alpha"
 MODEL_TAG = "LightGBM-Model"
 BINARY_PREFIX = "mihomo-linux-amd64-v3-alpha-smart-"
-BINARY_PATTERN = re.compile(re.escape(BINARY_PREFIX) + r"([0-9a-f]{7,40})\.gz\Z")
-VERSION_PATTERN = re.compile(r"(\d{8}\.\d{6})\.g([0-9a-f]{7,40})\Z")
+BINARY_PATTERN = re.compile(re.escape(BINARY_PREFIX) + r"([0-9a-f]{7,40})\.pkg\.tar\.zst\Z")
+VERSION_PATTERN = re.compile(r"((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))"
+                             r"\.alpha\.smart\.r([1-9][0-9]*)\.g([0-9a-f]{7,40})\Z")
 MAX_ASSET_SIZE = 1024 * 1024 * 1024
+MAX_METADATA_SIZE = 4 * 1024 * 1024
+MAX_ARCHIVE_MEMBERS = 4096
 FIELDS = ("pkgver", "pkgrel", "_commit", "_binary_sha256", "_model_sha256")
 
 
@@ -82,10 +84,6 @@ class ReleaseAssets:
     def commit(self):
         return BINARY_PATTERN.fullmatch(self.binary.name)[1]
 
-    @property
-    def version(self):
-        date = timestamp(self.binary.updated_at).strftime("%Y%m%d.%H%M%S")
-        return f"{date}.g{self.commit}"
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -156,7 +154,7 @@ def select_assets(client):
                 "Invalid release asset list")
         if tag == BINARY_TAG:
             matches = [a for a in assets if isinstance(a.get("name"), str)
-                       and a["name"].startswith(BINARY_PREFIX) and a["name"].endswith(".gz")]
+                       and a["name"].startswith(BINARY_PREFIX) and a["name"].endswith(".pkg.tar.zst")]
             require(len(matches) == 1, "Expected exactly one amd64 v3 smart binary")
             require(BINARY_PATTERN.fullmatch(matches[0]["name"]), "Invalid binary asset name")
         else:
@@ -176,35 +174,34 @@ def read_fields(text):
             value = value[1:-1]
         result[field] = value
     version = VERSION_PATTERN.fullmatch(result["pkgver"])
-    require(version is not None, "Current pkgver must use the calendar version format")
-    try:
-        dt.datetime.strptime(version[1], "%Y%m%d.%H%M%S")
-    except ValueError as exc:
-        raise UpdateError("Invalid current calendar version") from exc
+    require(version is not None, "Current pkgver must use upstream base and commit count")
     require(re.fullmatch(r"[1-9][0-9]*", result["pkgrel"]), "Invalid pkgrel")
     require(re.fullmatch(r"[0-9a-f]{7,40}", result["_commit"]), "Invalid current commit")
-    require(version[2] == result["_commit"], "pkgver and _commit disagree")
+    require(version[3] == result["_commit"], "pkgver and _commit disagree")
     for field in ("_binary_sha256", "_model_sha256"):
         require(re.fullmatch(r"[0-9a-f]{64}", result[field]), f"Invalid {field}")
     return result
 
 
-def plan(current, assets):
+def plan(current, assets, base=None, count=None):
     result = current.copy()
     same_commit = current["_commit"] == assets.commit
-    require(assets.version.split(".g")[0] >= current["pkgver"].split(".g")[0],
-            "Upstream binary timestamp moved backwards")
     if same_commit:
         require(current["_binary_sha256"] == assets.binary.sha256,
                 "Binary digest changed for the same commit; manual review required")
-        # Re-uploading identical bytes must not manufacture a new upstream version.
         if current["_model_sha256"] != assets.model.sha256:
             result["_model_sha256"] = assets.model.sha256
             result["pkgrel"] = str(int(current["pkgrel"]) + 1)
     else:
-        require(assets.version.split(".g")[0] > current["pkgver"].split(".g")[0],
-                "Upstream binary timestamp does not advance; rollback or ambiguous version")
-        result.update(pkgver=assets.version, pkgrel="1", _commit=assets.commit,
+        version = None
+        if base is not None:
+            old = VERSION_PATTERN.fullmatch(current["pkgver"])
+            require(type(count) is int and count > int(old[2]),
+                    "Upstream revision count does not advance")
+            require(tuple(map(int, base.split("."))) >= tuple(map(int, old[1].split("."))),
+                    "Upstream base version moved backwards")
+            version = f"{base}.alpha.smart.r{count}.g{assets.commit}"
+        result.update(pkgver=version, pkgrel="1", _commit=assets.commit,
                       _binary_sha256=assets.binary.sha256, _model_sha256=assets.model.sha256)
     return result
 
@@ -240,6 +237,121 @@ def validate_srcinfo(content, fields, assets):
                           content, re.MULTILINE), "Generated .SRCINFO has incorrect checksum")
 
 
+def validate_archive(path, commit):
+    """Inspect an upstream pacman package without extracting or executing it.
+
+    libarchive converts zstd to a tar stream; Python checks structured member
+    metadata and bounded payloads rather than parsing human-readable listings.
+    """
+    required = {".PKGINFO", "usr/bin/mihomo", "etc/mihomo/config.yaml",
+                "usr/lib/systemd/system/mihomo.service"}
+    seen, total, metadata = set(), 0, None
+    process = subprocess.Popen(
+        ["bsdtar", "-c", "-P", "--format=pax", "-f", "-", "@" + str(path.resolve())],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    try:
+        with tarfile.open(fileobj=process.stdout, mode="r|") as archive:
+            for member in archive:
+                name = member.name
+                while name.startswith("./"):
+                    name = name[2:]
+                parts = name.rstrip("/").split("/")
+                require(name and not name.startswith("/") and
+                        all(part not in ("", ".", "..") for part in parts) and
+                        "\\" not in name and not any(ord(c) < 32 for c in name),
+                        "Unsafe archive member path")
+                name = "/".join(parts)
+                require(name not in seen, "Duplicate archive member")
+                seen.add(name)
+                require(len(seen) <= MAX_ARCHIVE_MEMBERS, "Too many archive members")
+                require(member.isdir() or member.isreg(), "Unsafe archive member type")
+                if member.isdir():
+                    require(name not in required, "Required archive payload is not a file")
+                    continue
+                limit = MAX_ASSET_SIZE if name == "usr/bin/mihomo" else MAX_METADATA_SIZE
+                require(0 <= member.size <= limit, "Expanded archive member is too large")
+                total += member.size
+                require(total <= MAX_ASSET_SIZE + 16 * MAX_METADATA_SIZE,
+                        "Expanded archive is too large")
+                stream = archive.extractfile(member)
+                prefix = stream.read(min(member.size, 4))
+                if name == "usr/bin/mihomo":
+                    require(prefix == b"\x7fELF", "Binary is not an ELF executable")
+                payload = bytearray(prefix) if name == ".PKGINFO" else None
+                remaining = member.size - len(prefix)
+                while remaining:
+                    chunk = stream.read(min(remaining, 1024 * 1024))
+                    require(chunk, "Truncated archive member")
+                    remaining -= len(chunk)
+                    if payload is not None:
+                        payload.extend(chunk)
+                if payload is not None:
+                    metadata = payload.decode("utf-8")
+        # Consume tar padding and let libarchive report decompression failures.
+        require(len(process.stdout.read(MAX_METADATA_SIZE + 1)) <= MAX_METADATA_SIZE,
+                "Unexpected trailing archive data")
+        require(process.wait(timeout=60) == 0, "Invalid or truncated package archive")
+    except (tarfile.TarError, UnicodeError, EOFError) as exc:
+        raise UpdateError("Invalid or truncated package archive") from exc
+    finally:
+        process.stdout.close()
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+    require(required <= seen, "Missing required package payload")
+    values = {}
+    for line in metadata.splitlines():
+        if " = " in line and not line.startswith("#"):
+            key, value = line.split(" = ", 1)
+            values.setdefault(key, []).append(value)
+    require(values.get("pkgname") == ["mihomo"] and values.get("arch") == ["x86_64"],
+            "Unexpected upstream package identity")
+    versions = values.get("pkgver", [])
+    require(len(versions) == 1, "Expected one upstream package version")
+    version = re.fullmatch(r"((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))"
+                           r"\.alpha\.smart-" + re.escape(commit) + r"-smart-1", versions[0])
+    require(version is not None, "Unexpected upstream package version or release commit")
+    return version[1]
+
+
+def git_command(repo, *arguments):
+    env = os.environ.copy()
+    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0")
+    result = subprocess.run(["git", "-c", "core.hooksPath=" + os.devnull,
+                             "--git-dir=" + str(repo), *arguments],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            check=False, timeout=300, env=env)
+    require(result.returncode == 0, "Unable to verify upstream Git history")
+    return result.stdout.decode("ascii").strip()
+
+
+def inspect_history(repo, commit, previous):
+    """Verify a complete upstream graph and return its reachable commit count."""
+    require(git_command(repo, "rev-parse", "--is-shallow-repository") == "false",
+            "Shallow upstream Git history is not accepted")
+    head = git_command(repo, "rev-parse", "--verify", "refs/tags/upstream^{commit}")
+    require(head.startswith(commit), "Upstream tag does not match release asset commit")
+    # Resolve the asset prefix itself as well, rejecting ambiguous short hashes.
+    require(git_command(repo, "rev-parse", "--verify", commit + "^{commit}") == head,
+            "Ambiguous upstream asset commit")
+    ancestor = git_command(repo, "rev-parse", "--verify", previous + "^{commit}")
+    git_command(repo, "merge-base", "--is-ancestor", ancestor, head)
+    count = git_command(repo, "rev-list", "--count", head)
+    require(re.fullmatch(r"[1-9][0-9]*", count), "Invalid upstream commit count")
+    return int(count)
+
+
+def history_revision(commit, previous):
+    with tempfile.TemporaryDirectory(prefix="mihomo-history-") as directory:
+        repo = Path(directory) / "upstream.git"
+        git_command(repo, "init", "--bare", str(repo))
+        git_command(repo, "fetch", "--filter=blob:none", "--no-tags",
+                    "https://github.com/vernesong/mihomo.git",
+                    "refs/tags/Prerelease-Alpha:refs/tags/upstream")
+        return inspect_history(repo, commit, previous)
+
+
 def update(root, client, write=False):
     recipe, srcinfo = root / "PKGBUILD", root / ".SRCINFO"
     original = recipe.read_bytes()
@@ -254,15 +366,9 @@ def update(root, client, write=False):
                 path = Path(directory) / asset.name
                 client.download(asset, path)
                 if asset == assets.binary:
-                    try:
-                        with gzip.open(path, "rb") as stream:
-                            require(stream.read(4) == b"\x7fELF", "Binary is not an ELF executable")
-                            expanded = 4
-                            while chunk := stream.read(1024 * 1024):
-                                expanded += len(chunk)
-                                require(expanded <= MAX_ASSET_SIZE, "Expanded binary is too large")
-                    except (OSError, EOFError, zlib.error) as exc:
-                        raise UpdateError("Invalid or truncated gzip binary") from exc
+                    base = validate_archive(path, assets.commit)
+            if current["_commit"] != assets.commit:
+                fields = plan(current, assets, base, history_revision(assets.commit, current["_commit"]))
             require(select_assets(client) == assets,
                     "Upstream release changed during download; retry after it stabilizes")
         require(recipe.read_bytes() == original and
@@ -299,7 +405,7 @@ def main(argv=None):
         result = update(args.root, Client(), write=args.update)
         if args.github_output:
             with args.github_output.open("a", encoding="utf-8") as stream:
-                stream.write("".join(f"{key}={value}\n" for key, value in result.items()))
+                stream.write("".join(f"{key}={value}\n" for key, value in result.items() if value is not None))
         print(json.dumps(result, sort_keys=True))
     except (UpdateError, OSError, ValueError, subprocess.SubprocessError, urllib.error.URLError) as exc:
         # Avoid raw HTTP or subprocess output, which can contain authentication data.

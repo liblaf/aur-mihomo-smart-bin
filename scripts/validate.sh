@@ -28,10 +28,12 @@ cd "$project"
 if [[ -d /source-cache ]]; then
   for file in /source-cache/*; do
     case "${file##*/}" in
-      config.yaml|mihomo.service|Model.bin|mihomo-*.gz) cp "$file" . ;;
+      Model.bin|mihomo-*.pkg.tar.zst)
+        cp "$file" .
+        chown builder:builder "${file##*/}"
+        ;;
     esac
   done
-  chown builder:builder config.yaml mihomo.service Model.bin mihomo-*.gz
 fi
 shellcheck PKGBUILD
 as_builder makepkg --printsrcinfo > /tmp/generated.SRCINFO
@@ -47,6 +49,36 @@ cat /tmp/namcap-pkgbuild.log /tmp/namcap-package.log
 if grep -E ' E: ' /tmp/namcap-pkgbuild.log /tmp/namcap-package.log; then exit 1; fi
 pacman -U --noconfirm "$package" > /tmp/install.log 2>&1
 pacman -Qk mihomo-smart-bin
+test -f /usr/lib/systemd/system/mihomo@.service
+bsdtar -xOf "$package" .PKGINFO > /tmp/wrapper.PKGINFO
+python3 - <<'PY'
+from pathlib import Path
+import re
+import subprocess
+
+metadata = Path('/tmp/wrapper.PKGINFO').read_text().splitlines()
+assert 'pkgname = mihomo-smart-bin' in metadata
+assert [line for line in metadata if line.startswith('backup = ')] == [
+    'backup = etc/mihomo/config.yaml'
+]
+commit = re.search(r"^_commit=['\"]?([0-9a-f]+)", Path('PKGBUILD').read_text(), re.MULTILINE)[1]
+upstream = subprocess.check_output(
+    ['bsdtar', '-xOf', f'mihomo-{commit}.pkg.tar.zst', '.PKGINFO'], text=True
+).splitlines()
+for key in ('pkgdesc', 'url', 'arch', 'license', 'group', 'depend'):
+    prefix = key + ' = '
+    assert [line for line in metadata if line.startswith(prefix)] == [
+        line for line in upstream if line.startswith(prefix)
+    ], key
+print('Validated descriptive metadata against the upstream package.')
+PY
+cp /etc/mihomo/config.yaml /tmp/original-config.yaml
+printf '\n# Preserve this local edit during package upgrades.\n' >> /etc/mihomo/config.yaml
+cp /etc/mihomo/config.yaml /tmp/edited-config.yaml
+pacman -U --noconfirm "$package" > /tmp/reinstall.log 2>&1
+cmp /etc/mihomo/config.yaml /tmp/edited-config.yaml
+cp /tmp/original-config.yaml /etc/mihomo/config.yaml
+printf '%s\n' 'Validated package identity and preservation of local config edits.'
 as_builder mihomo -v > /tmp/version.txt
 cat /tmp/version.txt
 install -d -o builder -g builder /home/builder/smoke

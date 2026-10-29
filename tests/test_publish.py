@@ -45,6 +45,22 @@ class PublicationTests(unittest.TestCase):
         state = {"commit": self.run_git(self.aur, "rev-parse", "HEAD"),
                  "sha256": {n: self.hash(self.aur / n) for n in publish.FILES if n != "LICENSE"}}
         (self.root / "aur-state.json").write_text(json.dumps(state))
+        # The approved migration is committed in GitHub before publication;
+        # the tracked AUR state still describes the remote calendar/gzip recipe.
+        recipe = recipe.replace("20261021.194528.g1234567", "1.19.34.alpha.smart.r9.g1234567").replace("a" * 64, "e" * 64)
+        recipe = recipe.replace(
+            'package() { install -Dm755 mihomo "${pkgdir}/usr/bin/mihomo"; }',
+            'source=("mihomo-${_commit}.pkg.tar.zst::https://example.test/${_commit}.pkg.tar.zst" "Model-large.bin::https://example.test/Model-large.bin")\n'
+            'noextract=("mihomo-${_commit}.pkg.tar.zst")\n'
+            'package() { bsdtar -xf "mihomo-${_commit}.pkg.tar.zst" -C "${pkgdir}" usr etc; }')
+        info = info.replace("20261021.194528.g1234567", "1.19.34.alpha.smart.r9.g1234567").replace("a" * 64, "e" * 64)
+        info = info.replace("mihomo-1234567.gz::https://example.test/1234567.gz",
+                            "mihomo-1234567.pkg.tar.zst::https://example.test/1234567.pkg.tar.zst")
+        info = info.replace("\tsha256sums = ",
+                            "\tsource = Model-large.bin::https://example.test/Model-large.bin\n"
+                            "\tnoextract = mihomo-1234567.pkg.tar.zst\n\tsha256sums = ", 1)
+        (self.root / "PKGBUILD").write_text(recipe)
+        (self.root / ".SRCINFO").write_text(info)
         self.commit(self.root)
         self.base = self.run_git(self.root, "rev-parse", "HEAD")
         self.addCleanup(patch.stopall)
@@ -83,7 +99,7 @@ class PublicationTests(unittest.TestCase):
 
     def make_candidate(self, **changes):
         old = publish.scalars((self.root / "PKGBUILD").read_text())
-        new = old | {"pkgver": "20261022.194528.g7654321", "_commit": "7654321", "_binary_sha256": "c" * 64} | changes
+        new = old | {"pkgver": "1.19.34.alpha.smart.r10.g7654321", "pkgrel": "1", "_commit": "7654321", "_binary_sha256": "c" * 64} | changes
         recipe = (self.root / "PKGBUILD").read_text()
         for key, value in new.items():
             recipe = publish.re.sub(rf"^{key}=.*$", f"{key}='{value}'", recipe, flags=publish.re.MULTILINE)
@@ -136,6 +152,39 @@ class PublicationTests(unittest.TestCase):
         self.assert_prepared()
         self.assertEqual(self.aur_push_env["GIT_SSH_COMMAND"], "ssh -oBatchMode=yes")
         self.assertEqual(self.aur_push_env["GIT_LFS_SKIP_PUSH"], "1")
+
+    def test_archive_update_rewrites_source_and_noextract(self):
+        info = (self.candidate / ".SRCINFO").read_text()
+        self.assertIn("\tsource = mihomo-7654321.pkg.tar.zst::https://example.test/7654321.pkg.tar.zst\n", info)
+        self.assertIn("\tnoextract = mihomo-7654321.pkg.tar.zst\n", info)
+        self.assertNotIn("1234567", info)
+        self.assertEqual(publish.validate(self.candidate)["pkgrel"], "1")
+
+    def test_rejects_stale_archive_noextract_with_valid_manifest(self):
+        path = self.candidate / ".SRCINFO"
+        path.write_text(path.read_text().replace("\tnoextract = mihomo-7654321.pkg.tar.zst",
+                                                 "\tnoextract = mihomo-1234567.pkg.tar.zst"))
+        self.rehash()
+        with self.assertRaisesRegex(publish.PublishError, "regenerated metadata"):
+            publish.validate(self.candidate)
+
+    def test_committed_migration_publishes_over_tracked_gzip_baseline(self):
+        old_state = json.loads((self.root / "aur-state.json").read_text())
+        values = publish.scalars((self.root / "PKGBUILD").read_text())
+        self.make_candidate(**values)
+        manifest = publish.validate(self.candidate)
+        self.assertEqual(manifest["version"], "1.19.34.alpha.smart.r9.g1234567")
+        self.assertEqual(manifest["pkgrel"], "1")
+        self.assertNotIn("epoch", (self.candidate / "PKGBUILD").read_text())
+        self.assertNotEqual(old_state["sha256"]["PKGBUILD"], manifest["sha256"]["PKGBUILD"])
+        with patch.object(publish, "gh_api", side_effect=self.api):
+            publish.publish(self.candidate, self.aur)
+        aur_head = self.run_git(self.aur, "rev-parse", "HEAD")
+        self.assertEqual(self.run_git(self.aur, "rev-parse", "HEAD^"), old_state["commit"])
+        self.assertEqual(self.run_git(self.remote, "rev-parse", "HEAD"), aur_head)
+        self.assertEqual(publish.tree_hashes(self.aur, "HEAD"), manifest["sha256"])
+        self.assertEqual(json.loads((self.root / "aur-state.json").read_text()),
+                         {"commit": aur_head, "sha256": manifest["sha256"]})
 
     def test_failed_aur_push_does_not_prepare_github_files(self):
         before = self.root_files()
@@ -259,16 +308,52 @@ class PublicationTests(unittest.TestCase):
             publish.validate(self.candidate)
 
     def test_rejects_rollbacks_and_same_commit_binary_drift(self):
-        self.make_candidate(pkgver="20261020.194528.g7654321")
-        with self.assertRaisesRegex(publish.PublishError, "advance timestamp"):
+        self.make_candidate(pkgver="1.19.34.alpha.smart.r8.g7654321")
+        with self.assertRaisesRegex(publish.PublishError, "advance revision count"):
             publish.validate(self.candidate)
-        self.make_candidate(pkgver="20261021.194528.g1234567", _commit="1234567")
+        self.make_candidate(pkgver="1.19.34.alpha.smart.r9.g1234567", _commit="1234567")
         with self.assertRaisesRegex(publish.PublishError, "binary identity"):
             publish.validate(self.candidate)
 
+    def test_revision_count_orders_updates_before_commit_hash(self):
+        self.make_candidate(pkgver="1.19.34.alpha.smart.r10.g0000000", _commit="0000000")
+        self.assertEqual(publish.validate(self.candidate)["version"], "1.19.34.alpha.smart.r10.g0000000")
+
+    def test_upstream_base_comparison_is_numeric(self):
+        self.make_candidate(pkgver="1.20.0.alpha.smart.r10.g7654321")
+        self.assertEqual(publish.validate(self.candidate)["pkgrel"], "1")
+        self.make_candidate(pkgver="2.0.0.alpha.smart.r10.g7654321")
+        self.assertEqual(publish.validate(self.candidate)["pkgrel"], "1")
+
+    def test_rejects_base_rollback_nonincreasing_count_or_unreset_release(self):
+        for version, release in (("1.19.33.alpha.smart.r10.g7654321", "1"),
+                                 ("1.9.99.alpha.smart.r10.g7654321", "1"),
+                                 ("1.19.34.alpha.smart.r9.g7654321", "1"),
+                                 ("1.20.0.alpha.smart.r8.g7654321", "1"),
+                                 ("1.20.0.alpha.smart.r10.g7654321", "2")):
+            with self.subTest(version=version, release=release):
+                self.make_candidate(pkgver=version, pkgrel=release)
+                with self.assertRaisesRegex(publish.PublishError, "advance revision count"):
+                    publish.validate(self.candidate)
+
+    def test_rejects_same_commit_version_drift(self):
+        self.make_candidate(pkgver="1.19.34.alpha.smart.r10.g1234567", _commit="1234567",
+                            _binary_sha256="e" * 64)
+        with self.assertRaisesRegex(publish.PublishError, "binary identity"):
+            publish.validate(self.candidate)
+
+    def test_rejects_noncanonical_version_and_mismatched_commit(self):
+        for version in ("20261021.194528.g7654321", "1.19.34.alpha.smart.r0.g7654321",
+                        "1.19.34.alpha.smart.r010.g7654321", "01.19.34.alpha.smart.r10.g7654321",
+                        "1.19.34.alpha.smart.r10.g1234567"):
+            with self.subTest(version=version):
+                self.make_candidate(pkgver=version)
+                with self.assertRaises(publish.PublishError):
+                    publish.validate(self.candidate)
+
     def test_model_update_requires_exact_increment(self):
-        changes = {"pkgver": "20261021.194528.g1234567", "_commit": "1234567", "_binary_sha256": "a" * 64, "_model_sha256": "d" * 64}
-        self.make_candidate(**changes)
+        changes = {"pkgver": "1.19.34.alpha.smart.r9.g1234567", "_commit": "1234567", "_binary_sha256": "e" * 64, "_model_sha256": "d" * 64}
+        self.make_candidate(**changes, pkgrel="1")
         with self.assertRaisesRegex(publish.PublishError, "increment"):
             publish.validate(self.candidate)
         self.make_candidate(**changes, pkgrel="2")
