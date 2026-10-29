@@ -110,6 +110,7 @@ jobs:
     needs: [check, validate]
     environment: aur-publish
     if: >-
+      vars.AUR_PUBLISH_ENABLED == 'true' &&
       github.repository == 'liblaf/aur-mihomo-smart-bin' &&
       github.ref == 'refs/heads/main' &&
       (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')

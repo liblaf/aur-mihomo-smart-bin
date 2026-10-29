@@ -99,6 +99,7 @@ matching private key as the environment secret:
 ```bash
 gh secret set AUR_SSH_PRIVATE_KEY --repo liblaf/aur-mihomo-smart-bin \
   --env aur-publish < /path/to/dedicated/private-key
+gh variable set AUR_PUBLISH_ENABLED --repo liblaf/aur-mihomo-smart-bin --body true
 gh workflow run update.yml --repo liblaf/aur-mihomo-smart-bin \
   -f validate_current=true
 ```
@@ -123,6 +124,10 @@ Pushes and pull requests run validation without publication. Scheduled and manua
 runs on this repository's `main` branch can publish. Successful monthly validation
 records keep the repository active; GitHub can disable public-repository schedules
 after 60 days without activity if those checks stop succeeding.
+
+Publishing starts disabled with `AUR_PUBLISH_ENABLED=false` until the dedicated
+public key is registered with AUR. Checks and validation continue while it is
+disabled. Set the variable to `false` again to stop publication.
 
 ## Maintain locally
 
