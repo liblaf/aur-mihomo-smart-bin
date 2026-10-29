@@ -1,0 +1,8 @@
+{
+  "commit": "346507454b34f8312b0ef7fa814af83684193a9d",
+  "sha256": {
+    ".SRCINFO": "a5cd7dcf8e9ec3c80e4e0efec130c7add01874427b3b53d70ac567dc82f379f2",
+    "PKGBUILD": "4badfbd236b14c991a4d88f1b33171ebffbd99ea734ab92b6e3b7193713d4a35",
+    "mihomo-smart-bin.install": "bdc6d608c0e1b5d72af0ec78ed9dbdb089d7aad0b6296529871073354d3a3524"
+  }
+}

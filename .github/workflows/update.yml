@@ -1,0 +1,155 @@
+name: Validate and update Mihomo Smart
+
+on:
+  schedule:
+    # UTC; 02:37, 08:37, 14:37, and 20:37 Asia/Shanghai.
+    - cron: '37 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      validate_current:
+        description: Validate and synchronize the current package
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mihomo-smart-${{ github.event_name == 'pull_request' && github.ref || 'update' }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      changed: ${{ steps.release.outputs.changed }}
+      aur_sync: ${{ steps.aur.outputs.needed }}
+      maintenance_due: ${{ steps.health.outputs.needed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test release and publication safeguards
+        run: python3 -m unittest discover -s tests -v
+      - name: Inspect the rolling Smart release and model
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/update.py --check --github-output "$GITHUB_OUTPUT"
+      - name: Check AUR synchronization
+        id: aur
+        run: |
+          git clone --quiet https://aur.archlinux.org/mihomo-smart-bin.git "$RUNNER_TEMP/aur-state"
+          needed=false
+          for file in PKGBUILD .SRCINFO mihomo-smart-bin.install LICENSE; do
+            if ! cmp -s "$file" "$RUNNER_TEMP/aur-state/$file"; then needed=true; fi
+          done
+          echo "needed=$needed" >> "$GITHUB_OUTPUT"
+      - name: Check monthly compatibility validation
+        id: health
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timedelta, timezone
+          from pathlib import Path
+          report = Path('automation-validation.json')
+          due = not report.exists()
+          if report.exists():
+              checked = datetime.fromisoformat(json.loads(report.read_text())['validated_at'])
+              due = datetime.now(timezone.utc) - checked >= timedelta(days=28)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'needed={str(due).lower()}\n')
+          PY
+
+  validate:
+    needs: check
+    if: >-
+      needs.check.outputs.changed == 'true' ||
+      needs.check.outputs.aur_sync == 'true' ||
+      needs.check.outputs.maintenance_due == 'true' ||
+      github.event_name == 'push' ||
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' && inputs.validate_current)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build, install, and exercise Smart groups in Arch Linux
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/candidate"
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/workspace:ro" \
+            --volume "$RUNNER_TEMP/candidate:/candidate" \
+            --env "BASE_COMMIT=$GITHUB_SHA" \
+            --env GH_TOKEN \
+            archlinux:base bash /workspace/scripts/validate.sh
+      - name: Upload validated packaging files
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: aur-metadata
+          path: |
+            ${{ runner.temp }}/candidate/PKGBUILD
+            ${{ runner.temp }}/candidate/.SRCINFO
+            ${{ runner.temp }}/candidate/mihomo-smart-bin.install
+            ${{ runner.temp }}/candidate/LICENSE
+            ${{ runner.temp }}/candidate/manifest.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    needs: [check, validate]
+    environment: aur-publish
+    if: >-
+      github.repository == 'liblaf/aur-mihomo-smart-bin' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: aur-metadata
+          path: ${{ runner.temp }}/candidate
+      - name: Prepare dedicated AUR authentication
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          if [ -z "$AUR_SSH_PRIVATE_KEY" ]; then
+            echo 'Configure AUR_SSH_PRIVATE_KEY in the aur-publish environment before publishing.' >&2
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$RUNNER_TEMP/aur-key"
+          ssh-keygen -y -P '' -f "$RUNNER_TEMP/aur-key" > /dev/null
+      - name: Publish to AUR and record the validated version on GitHub
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GIT_LFS_SKIP_PUSH: '1'
+          GIT_SSH_COMMAND: >-
+            ssh -i "${{ runner.temp }}/aur-key" -o BatchMode=yes
+            -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="${{ github.workspace }}/config/aur-known-hosts"
+            -o ConnectTimeout=15
+        run: |
+          git clone --quiet --branch master ssh://aur@aur.archlinux.org/mihomo-smart-bin.git "$RUNNER_TEMP/aur"
+          python3 scripts/publish.py --candidate "$RUNNER_TEMP/candidate" --aur-checkout "$RUNNER_TEMP/aur" --branch main
+      - name: Remove temporary key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/aur-key"

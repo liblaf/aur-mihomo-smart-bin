@@ -1,0 +1,11 @@
+/src/
+/pkg/
+/*.gz
+/*.bin
+/*.pkg.tar*
+/*.src.tar*
+/*.log
+/config.yaml
+/mihomo.service
+__pycache__/
+.pytest_cache/
