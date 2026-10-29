@@ -42,6 +42,8 @@ def gh_api(args: tuple[str, ...], payload: dict | None = None) -> dict:
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if result.returncode:
         raise PublishError("GitHub API failed: " + result.stderr.strip())
+    if not result.stdout.strip():
+        return {}
     try:
         response = json.loads(result.stdout)
         if not isinstance(response, dict) or response.get("errors"):
@@ -204,8 +206,12 @@ def publish(candidate: Path, aur: Path, branch: str = "main") -> None:
     if os.environ.get("GITHUB_REPOSITORY") != REPOSITORY:
         raise PublishError("publication requires trusted GitHub repository")
     run = os.environ.get("GITHUB_RUN_ID", "")
-    if not run.isdecimal():
-        raise PublishError("missing GitHub Actions run id")
+    attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+    github_ssh = os.environ.get("GITHUB_GIT_SSH_COMMAND")
+    if not run.isdecimal() or not attempt.isdecimal():
+        raise PublishError("missing GitHub Actions run id or attempt")
+    if not github_ssh:
+        raise PublishError("trusted GitHub SSH command is required")
     base = manifest["base_commit"]
     response = gh_api((f"repos/{REPOSITORY}/git/ref/heads/main",))
     if response.get("object", {}).get("sha") != base:
@@ -231,17 +237,33 @@ def publish(candidate: Path, aur: Path, branch: str = "main") -> None:
                 if (ROOT / name).read_bytes() != (candidate / name).read_bytes()}
     for name, value in (("aur-state.json", state), ("automation-validation.json", report)):
         contents[name] = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
+    temporary_branch = f"aur-automation/{run}-{attempt}"
     payload = {"query": "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }",
-               "variables": {"input": {"branch": {"repositoryNameWithOwner": REPOSITORY, "branchName": branch},
+               "variables": {"input": {"branch": {"repositoryNameWithOwner": REPOSITORY, "branchName": temporary_branch},
                "expectedHeadOid": base, "message": {"headline": f"chore: update mihomo-smart-bin {manifest['version']}-{manifest['pkgrel']} [skip ci]"},
                "fileChanges": {"additions": [{"path": name, "contents": b64encode(data).decode()} for name, data in contents.items()]}}}}
-    response = gh_api(("graphql", "--input", "-"), payload)
+    gh_api(("--method", "POST", f"repos/{REPOSITORY}/git/refs", "--input", "-"),
+           {"ref": f"refs/heads/{temporary_branch}", "sha": base})
     try:
-        oid = response["data"]["createCommitOnBranch"]["commit"]["oid"]
-        if not isinstance(oid, str) or not COMMIT.fullmatch(oid):
-            raise ValueError("invalid commit")
-    except (KeyError, TypeError, ValueError) as error:
-        raise PublishError("GitHub did not create publication commit; rerun to recover AUR push") from error
+        response = gh_api(("graphql", "--input", "-"), payload)
+        try:
+            oid = response["data"]["createCommitOnBranch"]["commit"]["oid"]
+            if not isinstance(oid, str) or not COMMIT.fullmatch(oid):
+                raise ValueError("invalid commit")
+        except (KeyError, TypeError, ValueError) as error:
+            raise PublishError("GitHub did not create publication commit; rerun to recover AUR push") from error
+        verification = gh_api((f"repos/{REPOSITORY}/git/commits/{oid}",)).get("verification", {})
+        if not isinstance(verification, dict) or verification.get("verified") is not True:
+            raise PublishError("GitHub publication commit is not verified")
+        github_env = os.environ.copy()
+        github_env["GIT_SSH_COMMAND"] = github_ssh
+        github_env["GIT_LFS_SKIP_PUSH"] = "1"
+        remote = f"git@github.com:{REPOSITORY}.git"
+        git(ROOT, "fetch", "--no-tags", remote, f"refs/heads/{temporary_branch}", env=github_env)
+        git(ROOT, "-c", "push.gpgSign=false", "push", remote, f"{oid}:refs/heads/{branch}", env=github_env)
+    finally:
+        gh_api(("--method", "DELETE", f"repos/{REPOSITORY}/git/refs/heads/{temporary_branch}"))
+
 
 
 def main() -> None:

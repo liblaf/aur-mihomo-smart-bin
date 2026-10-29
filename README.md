@@ -103,12 +103,21 @@ gh workflow run update.yml --repo liblaf/aur-mihomo-smart-bin \
   -f validate_current=true
 ```
 
-The private key is never committed. Validation jobs have no AUR credentials or
+The private key is never committed. A second `GH_DEPLOY_KEY` environment secret
+holds a write deploy key scoped to this GitHub repository; its public half is
+tracked in
+[config/github-actions-key.pub](https://github.com/liblaf/aur-mihomo-smart-bin/blob/main/config/github-actions-key.pub).
+Validation jobs have no AUR credentials or
 GitHub write token. The publishing job downloads only packaging metadata and
 never executes the downloaded core or a candidate recipe. AUR's server host key
 is pinned in
 [config/aur-known-hosts](https://github.com/liblaf/aur-mihomo-smart-bin/blob/main/config/aur-known-hosts).
-GitHub commits use the workflow token and the expected current `main` commit.
+The workflow creates GitHub commits on a temporary branch using the workflow
+token, verifies GitHub's signature, then advances `main` with the scoped deploy
+key. The `main-integrity` ruleset still requires verified signatures and forbids
+force pushes, deletion, and branch creation. The `main-review` ruleset preserves
+human review requirements and grants that deploy key a review bypass for
+validated automatic publication.
 
 Pushes and pull requests run validation without publication. Scheduled and manual
 runs on this repository's `main` branch can publish. Successful monthly validation

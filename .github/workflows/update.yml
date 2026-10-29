@@ -130,18 +130,26 @@ jobs:
       - name: Prepare dedicated AUR authentication
         env:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          GH_DEPLOY_KEY: ${{ secrets.GH_DEPLOY_KEY }}
         run: |
-          if [ -z "$AUR_SSH_PRIVATE_KEY" ]; then
-            echo 'Configure AUR_SSH_PRIVATE_KEY in the aur-publish environment before publishing.' >&2
+          if [ -z "$AUR_SSH_PRIVATE_KEY" ] || [ -z "$GH_DEPLOY_KEY" ]; then
+            echo 'Configure AUR_SSH_PRIVATE_KEY and GH_DEPLOY_KEY in the aur-publish environment before publishing.' >&2
             exit 1
           fi
           umask 077
           printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$RUNNER_TEMP/aur-key"
           ssh-keygen -y -P '' -f "$RUNNER_TEMP/aur-key" > /dev/null
+          printf '%s\n' "$GH_DEPLOY_KEY" > "$RUNNER_TEMP/github-key"
+          ssh-keygen -y -P '' -f "$RUNNER_TEMP/github-key" > /dev/null
       - name: Publish to AUR and record the validated version on GitHub
         env:
           GH_TOKEN: ${{ github.token }}
           GIT_LFS_SKIP_PUSH: '1'
+          GITHUB_GIT_SSH_COMMAND: >-
+            ssh -i "${{ runner.temp }}/github-key" -o BatchMode=yes
+            -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="${{ github.workspace }}/config/github-known-hosts"
+            -o ConnectTimeout=15
           GIT_SSH_COMMAND: >-
             ssh -i "${{ runner.temp }}/aur-key" -o BatchMode=yes
             -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes
@@ -152,4 +160,4 @@ jobs:
           python3 scripts/publish.py --candidate "$RUNNER_TEMP/candidate" --aur-checkout "$RUNNER_TEMP/aur" --branch main
       - name: Remove temporary key
         if: always()
-        run: rm -f "$RUNNER_TEMP/aur-key"
+        run: rm -f "$RUNNER_TEMP/aur-key" "$RUNNER_TEMP/github-key"

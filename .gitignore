@@ -9,3 +9,4 @@
 /mihomo.service
 __pycache__/
 .pytest_cache/
+/prek.*.flamegraph.svg
