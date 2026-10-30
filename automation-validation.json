@@ -1,7 +1,7 @@
 {
-  "base_commit": "e3dcb499ce64ce511764e7d2efa9caec108d072a",
+  "base_commit": "838f0650603567bdc819e3df331d4a53d40ef406",
   "pkgrel": "1",
-  "run_url": "https://github.com/liblaf/aur-mihomo-smart-bin/actions/runs/40872666076",
-  "validated_at": "2026-10-29T12:24:42.715645+00:00",
-  "version": "1.19.34.alpha.smart.r4831.g4624551"
+  "run_url": "https://github.com/liblaf/aur-mihomo-smart-bin/actions/runs/41139370833",
+  "validated_at": "2026-10-30T22:39:18.268549+00:00",
+  "version": "1.19.34.alpha.smart.r4842.g77af480"
 }
